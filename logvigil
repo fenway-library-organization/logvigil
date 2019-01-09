@@ -66,7 +66,7 @@ my %default_conf = (
     'control.action'   => 'default',
     'whitelist.message' => '%(date) %(time) WHITELIST %(client) %(class)',
 );
-my @booleans = qw(syslog verbose debug flush);
+my @booleans = qw(syslog verbose debug flush daemon);
 my (%conf, %cmdline_conf);
 my ($check_config, $dryrun);
 my $default_config_file = '/etc/logvigil/logvigil.conf';
@@ -90,6 +90,7 @@ GetOptions(
     'k|window=i'      => sub { $cmdline_conf{'window'}    = $_[1] },
     'l|threshold=i'   => sub { $cmdline_conf{'threshold'} = $_[1] },
     'F|no-flush'      => sub { $cmdline_conf{'flush'}     = 0     },
+    'b|daemon'        => sub { $cmdline_conf{'daemon'}    = 0     },
 ) or usage;
 
 if ($dryrun) {
@@ -102,6 +103,8 @@ my %action = default_actions();
 
 load_config();
 quit() if $check_config;
+
+daemonize() if $conf{'daemon'} && !$dryrun;
 
 # --- Variables
 
@@ -651,7 +654,7 @@ sub make_whitelist {
             s/^ipv4=//i;
             $w = \@w4;
         }
-        push @$w, $_;
+        push @$w, Net::CIDR::Lite->new($_);
         if (@$addrs && $addrs->[0] =~ /^@(.+)/) {
             push @$w, $1;
             shift @$addrs;
@@ -892,6 +895,18 @@ sub quit {
             delete $sec2hits{$sec}->{$key};
         }
     }
+}
+
+sub daemonize {
+    my $pid = fork;
+    fatal "fork: $!" if !defined $pid;
+    exit(0) if $pid;
+    # We're in the child now
+    open STDIN,  '<', '/dev/null' or fatal "open STDIN from /dev/null: $!";
+    open STDOUT, '>', '/dev/null' or fatal "open STDOUT to /dev/null: $!";
+    open STDERR, '>&STDOUT'       or fatal "open STDERR to STDOUT: $!";
+    chdir '/' or fatal "chdir /: $!";
+    POSIX::setsid();
 }
 
 sub usage {
