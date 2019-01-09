@@ -13,6 +13,12 @@ use File::Basename qw(basename dirname);
 use Getopt::Long
     qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
 
+# Queue entry index constants
+use constant TIME   => 0;
+use constant EXPIRE => 1;
+use constant ARGS   => 2;
+use constant VKEY   => 3;
+
 use constant MAX_TIMEOUT => 60;
 use constant NEVER => 4294967295;  # 2 ** 32 - 1 == 21060207T062815Z
 
@@ -100,7 +106,7 @@ exit 0 if $check_config;
 my ($now, $hup);
 my (%prev_date, %prev_tz, %whitelist_cache);
 my %sec2hits;
-my @queue = ( [NEVER, sub { exit 0 }, {}, {}] );
+my @queue = ( [NEVER, sub { exit 0 }, {}, ''] );
 my %violation;
 if (!$action{'default'}) {
     my $name = $conf{'action'};
@@ -181,8 +187,8 @@ while (1) {
                 next ENTRY;
             }
             foreach my $w (@whitelists) {
-                my $key2class = $w->find($client);
-                if (exists $key2class->{$client}) {
+                my $key2class = eval { $w->find($client) };
+                if (defined $key2class && exists $key2class->{$client}) {
                     my @classes = keys %{ $key2class->{$client} };
                     if (@classes) {
                         my %c = ( %conf, %$entry, %{ $whitelist_var{$w} }, 'class' => join(',', @classes) );
@@ -246,13 +252,13 @@ sub read_next {
 
 sub check_queue {
     my $t;
-    while (@queue && ($t = $queue[0][0]) <= $now) {
-        my $entry = shift @queue;
-        my (undef, $exp, $arg, $viol) = @$entry;
+    while (@queue && ($t = $queue[0][TIME]) <= $now) {
+        my $v = shift @queue;
+        my ($exp, $arg, $vkey) = @$v[EXPIRE, ARGS, VKEY];
         $exp->(%$arg);
-        delete $violation{$viol->{'key'}};
+        delete $violation{$vkey};
     }
-    $t = $queue[0][0] - $now;
+    $t = $queue[0][TIME] - $now;
     return MAX_TIMEOUT if $t <= 0 || $t > MAX_TIMEOUT;
     return $t;
 }
@@ -317,40 +323,39 @@ sub violation {
     my $dur = dur2sec($arg{'duration'});
     my $cmd = $action{$arg{'action'} ||= 'default'} || return;
     my $exp = $action{$arg{'expire'} ||= 'expire'};
-    my $key = sprintf '%s=%s', @arg{qw(client action)};
-    my $viol = $violation{$key} ||= {
-        'key' => $key,
-        'expire' => $exp,
-        'arguments' => \%arg,
-        'queued' => undef,
-    };
-    $cmd->(%arg) if !$viol->{'queued'};  # First violation
-    enqueue($now + $dur, $viol);
+    my $vkey = sprintf '%s=%s', @arg{qw(client action)};
+    my @q;
+    @q[TIME, EXPIRE, ARGS, VKEY] = ($now + $dur, $exp, \%arg, $vkey);
+    $cmd->(%arg) if !$violation{$vkey};  # First violation
+    enqueue(@q);
 }
 
 sub enqueue {
-    my ($t, $viol) = @_;
-    my ($exp, $arg) = @$viol{qw(expires arguments)};
-    my $q = $viol->{'queued'};
-    if ($q) {
+    my @v = @_;
+    my ($t, $exp, $arg, $vkey) = @v[TIME, EXPIRE, ARGS, VKEY];
+    my $v = $violation{$vkey};
+    if ($v) {
         # Update expiration time of already queued violation
-        $q->[0] = $t;
-        @queue = sort { $a->[0] <=> $b->[0] } @queue;
-        return;
+        $v->[TIME] = $t;
+        # @queue = sort { $a->[TIME] <=> $b->[TIME] } @queue;
+        # Remove from queue so we can add it again later
+        @queue = grep { $_->[VKEY] ne $vkey } @queue;
     }
-    # Add new violation to the expires queue
-    $q = $viol->{'queued'} = [$t, $exp, $arg, $viol];
+    else {
+        # Add new violation to the expires queue
+        $v = $violation{$vkey} = \@v;
+    }
     my ($l, $r) = (0, scalar @queue);
     while ($l < $r) {
         my $i = int(($l+$r)/2);
-        if ($t > $queue[$i][0]) {
+        if ($t > $queue[$i][TIME]) {
             $l = $i + 1;
         }
         else {
             $r = $i;
         }
     }
-    splice @queue, $l, 0, $q;
+    splice @queue, $l, 0, \@v;
 }
 
 sub expand {
@@ -772,14 +777,14 @@ sub flush {
     # Leave the tail entry in the queue!
     QUEUE:
     while (@queue > 1) {
-        my $entry = shift @queue;
-        my ($t, $exp, $arg, $viol) = @$entry;
+        my $v = shift @queue;
+        my ($t, $exp, $arg, $vkey) = @$v[TIME, EXPIRE, ARGS, VKEY];
         while (my ($k, $v) = each %arg) {
             next QUEUE if !defined $arg->{$k};
             next QUEUE if $arg->{$k} ne $arg{$k};
         }
         $exp->(%$arg);
-        delete $violation{$viol->{'key'}};
+        delete $violation{$vkey};
     }
 }
 
@@ -794,7 +799,7 @@ sub dump {
         $fh = \*STDOUT;
     }
     foreach (@queue[0..$#queue-1]) {
-        my ($t, undef, $arg, $viol) = @$_;
+        my ($t, $arg) = @$_[TIME, ARGS];
         my %arg = ( %$arg, 'expiration' => strftime('%Y%m%dT%H%M%S', localtime($t)) );
         foreach my $key (sort keys %arg) {
             my $val = $arg{$key};
