@@ -6,7 +6,8 @@ use warnings;
 use lib 'lib';
 
 use IO::Select;
-use POSIX qw(strftime setsid);
+use POSIX qw(strftime setsid :sys_wait_h);
+use Errno;
 use Net::CIDR::Lite;
 use File::Spec;
 use File::Basename qw(basename dirname);
@@ -146,7 +147,7 @@ my $running = 1;
                 kill $pid if $pid;
             };
         };
-        $SIG{CHLD} = 'IGNORE';
+        $SIG{CHLD} = \&reaper;
         $pid = open $fh, '-|', qw(tail -F -n 0), @logfiles;
         die $! if !$pid;
     }
@@ -909,6 +910,14 @@ sub daemonize {
     open STDERR, '>&STDOUT'       or fatal "open STDERR to STDOUT: $!";
     chdir '/' or fatal "chdir /: $!";
     setsid();
+}
+
+sub reaper {
+    local $!;   # don't let waitpid() overwrite current error
+    while ((my $pid = waitpid(-1, WNOHANG)) > 0 && WIFEXITED($?)) {
+        1;
+    }
+    $SIG{CHLD} = \&reaper;  # loathe SysV
 }
 
 sub usage {
