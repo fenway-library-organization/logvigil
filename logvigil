@@ -7,7 +7,6 @@ use lib 'lib';
 
 use IO::Select;
 use POSIX qw(strftime);
-use Sys::Syslog qw(:standard :macros);
 use Net::CIDR::Lite;
 use File::Spec;
 use File::Basename qw(basename dirname);
@@ -19,6 +18,9 @@ use constant NEVER => 4294967295;  # 2 ** 32 - 1 == 21060207T062815Z
 
 $| = 1;
 $0 = 'logvigil';
+
+sub usage;
+sub fatal;
 
 my %month = qw(Jan 01  Feb 02  Mar 03  Apr 04  May 05  Jun 06
                Jul 07  Aug 08  Sep 09  Oct 10  Nov 11  Dec 12);
@@ -43,7 +45,7 @@ my %default_conf = (
     'action'    => 'default',  # default violation action
     'expire'    => 'default',  # default expiry action
     'duration'  => 60,  # banishment duration (by convention)
-    'syslog'    =>  1,  # don't use syslog
+    'syslog'    =>  0,  # don't use syslog
     'verbose'   =>  0,  # don't spew
     'debug'     =>  0,  # no debugging stuff
     'threshold' => 10,  # max 10 requests...
@@ -66,10 +68,10 @@ my @config_files;
 GetOptions(
     'c|config-file=s' => \@config_files,
     'D|define=s' => sub {
-        $_[1] =~ /^(\w+)=(.*)$/ or exit usage();
+        $_[1] =~ /^(\w+)=(.*)$/ or usage;
         $cmdline_conf{$1} = $2;
     },
-    'n|check-config'  => \$check_config,
+    'n|check-config'  => sub { $cmdline_conf{'verbose'}   = $check_config = 1 },
     's|syslog'        => sub { $cmdline_conf{'syslog'}    = 1     },
     'S|nosyslog'      => sub { $cmdline_conf{'syslog'}    = 0     },
     'v|verbose'       => sub { $cmdline_conf{'verbose'}   = 1     },
@@ -79,7 +81,7 @@ GetOptions(
     'i|interval=i'    => sub { $cmdline_conf{'interval'}  = $_[1] },
     'k|window=i'      => sub { $cmdline_conf{'window'}    = $_[1] },
     'l|threshold=i'   => sub { $cmdline_conf{'threshold'} = $_[1] },
-) or exit usage();
+) or usage;
 
 my %action = default_actions();
 @config_files = ($default_config_file) if !@config_files;
@@ -87,7 +89,6 @@ my %action = default_actions();
 load_config();
 
 if ($check_config) {
-    print STDERR "Config file OK\n" if $cmdline_conf{'verbose'};
     exit 0;
 }
 
@@ -147,7 +148,7 @@ $SIG{HUP} = sub { $hup = 1 };
 
 my $file = @logfiles ? $logfiles[0] : '/dev/stdin';
 my ($date, $tz);
-openlog 'logvigil', '', 'local0' if $conf{'syslog'};
+openlog('logvigil', '', 'local0') if $conf{'syslog'};
 
 ENTRY:
 while (1) {
@@ -205,7 +206,7 @@ continue {
     ($prev_date{$file}, $prev_tz{$file}) = ($date, $tz) if defined $file;
 }
 
-closelog if $conf{'syslog'};
+closelog() if $conf{'syslog'};
 
 # --- Functions
 
@@ -452,11 +453,14 @@ sub read_config_file {
         ||
         _syntax_error($tok);
     }
+    print STDERR "config file OK: $f\n" if $check_config;
 }
 
 sub _syntax_error {
     my ($tok) = @_;
-    die "tok: @$tok\n";
+    my $i = @$tok - 1;
+    $i = 9 if $i > 9;
+    fatal 'syntax error:', @$tok[0..$i];
 }
 
 sub _assignment {
@@ -713,11 +717,6 @@ sub boolean {
     return ( defined($_[0]) && $_[0] =~ /^(y|yes|true|on|1)$/i ) ? 1 : 0;
 }
 
-sub usage {
-    print STDERR "usage: logvigil [OPTION]... [COMMAND [ARG]...]\n";
-    exit 1;
-}
-
 sub hup {
     print STDERR "logvigil: reloading config files...\n" if $conf{'verbose'};
     load_config();
@@ -734,6 +733,14 @@ sub load_config {
         $conf{$key} = $val;
     }
     $conf{$_} = boolean($conf{$_}) for @booleans;
+    # Optional modules
+    if (!$check_config) {
+        # Sys::Syslog provides syslog() etc.
+        if ($conf{'syslog'} && !__PACKAGE__->can('syslog')) {
+            require Sys::Syslog;
+            Sys::Syslog->import(qw(:standard :macros));
+        }
+    }
 }
 
 sub parse_args {
@@ -836,5 +843,15 @@ sub default_actions {
             delete $sec2hits{$sec}->{$key};
         }
     }
+}
+
+sub usage {
+    print STDERR "usage: logvigil [OPTION]... [COMMAND [ARG]...]\n";
+    exit 1;
+}
+
+sub fatal {
+    print STDERR "logvigil: @_\n";
+    exit 2;
 }
 
