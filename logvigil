@@ -100,7 +100,7 @@ exit 0 if $check_config;
 my ($now, $hup);
 my (%prev_date, %prev_tz, %whitelist_cache);
 my %sec2hits;
-my @queue = [ NEVER, sub { exit 0 }, {} ];
+my @queue = ( [NEVER, sub { exit 0 }, {}] );
 my %expire_action;
 if (!$action{'default'}) {
     my $name = $conf{'action'};
@@ -334,10 +334,6 @@ sub enqueue {
     }
     splice @queue, $l, 0, [$t, $exp, $arg];
 }
-# while ($i > 0 && $t < $queue[$i][0]) {
-#     $i--;
-# }
-# splice @queue, $i+1, 0, [$t, $exp, $arg];
 
 sub expand {
     my ($val, $var) = @_;
@@ -797,10 +793,15 @@ sub default_actions {
     return (
         'HUP'   => \&hup,
         'FLUSH' => \&flush,
-        'EXIT'  => sub { exit 0 },
+        'EXIT'  => \&quit,
         'DUMP'  => \&dump,
         'VIOL'  => \&control_violation,
     );
+}
+
+sub quit {
+    print STDERR "exiting\n";
+    exit 0;
 }
 
 {
