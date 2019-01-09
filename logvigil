@@ -36,10 +36,10 @@ my %multiplier = qw(
 # --- Options
 
 my (@skips, @whitelists, @triggers);
-push @whitelists, make_whitelist([qw(127.0.0.1/8 @private 10.0.0.0/8 @private 172.16.0.0/12 @private 192.168.0.0/16 @local)]);
-
-my %silent_whitelist = qw(127.0.0.1 ::1);
 my %whitelist_var;
+
+push @whitelists, make_whitelist([qw(127.0.0.1/8 @private 10.0.0.0/8 @private 172.16.0.0/12 @private 192.168.0.0/16 @local)]);
+my %silent_whitelist = qw(127.0.0.1 ::1);
 
 my %default_conf = (
     'action'    => 'default',  # default violation action
@@ -57,7 +57,7 @@ my %default_conf = (
     'trigger.action'   => 'default',
     'control.message'   => '%(date) %(time) VIOLATION %(client) %(port)',
     'control.action'   => 'default',
-    'whitelist.message' => '%(date) %(time) PASS %(client) %(class)',
+    'whitelist.message' => '%(date) %(time) WHITELIST %(client) %(class)',
 );
 my @booleans = qw(syslog verbose debug);
 my (%conf, %cmdline_conf);
