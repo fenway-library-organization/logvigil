@@ -108,7 +108,7 @@ exit 0 if $check_config;
 my ($now, $hup);
 my (%prev_date, %prev_tz, %whitelist_cache);
 my %sec2hits;
-my @queue = ( [NEVER, sub { exit 0 }, {}, ''] );
+my @queue = ( [NEVER, \&quit, {}, ''] );
 my %violation;
 if (!$action{'default'}) {
     my $name = $conf{'action'};
@@ -229,7 +229,7 @@ continue {
 }
 
 $_->() for @cleanup;
-flush() if $conf{'flush'};
+quit();
 
 # --- Functions
 
@@ -608,7 +608,7 @@ sub make_action {
         $status ||= 0;
         return sub {
             print STDERR join(' ', @msg), "\n" if @msg;
-            exit $status;
+            quit($status);
         };
     }
     elsif ($type eq 'print') {
@@ -839,8 +839,10 @@ sub default_actions {
 }
 
 sub quit {
+    my ($status) = @_;
+    flush() if $conf{'flush'};
     print STDERR "exiting\n";
-    exit 0;
+    exit($status||0);
 }
 
 {
