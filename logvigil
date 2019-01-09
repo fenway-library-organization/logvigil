@@ -57,6 +57,7 @@ my %default_conf = (
     'threshold' => 10,  # max 10 requests...
     'interval'  =>  1,  #     ...in 1 second
     'window'    => 30,  # look "back" 30 seconds at most
+    'flush'     =>  1,  # perform expire actions at exit
     'threshold.message' => '%(date) %(time) VIOLATION %(client) %(port) -- %(count) requests in %(interval) seconds for %(url)',
     'threshold.action' => 'default',
     'trigger.message'   => '%(date) %(time) VIOLATION %(client) %(port) -- %(url) matches %(trigger)',
@@ -65,7 +66,7 @@ my %default_conf = (
     'control.action'   => 'default',
     'whitelist.message' => '%(date) %(time) WHITELIST %(client) %(class)',
 );
-my @booleans = qw(syslog verbose debug);
+my @booleans = qw(syslog verbose debug flush);
 my (%conf, %cmdline_conf);
 my ($check_config, $dryrun);
 my $default_config_file = '/etc/logvigil/logvigil.conf';
@@ -88,6 +89,7 @@ GetOptions(
     'i|interval=i'    => sub { $cmdline_conf{'interval'}  = $_[1] },
     'k|window=i'      => sub { $cmdline_conf{'window'}    = $_[1] },
     'l|threshold=i'   => sub { $cmdline_conf{'threshold'} = $_[1] },
+    'F|no-flush'      => sub { $cmdline_conf{'flush'}     = 0     },
 ) or usage;
 
 if ($dryrun) {
@@ -120,7 +122,8 @@ if (!$action{'expire'}) {
 # --- Tail the specified files if applicable
 
 my @logfiles;
-my ($fh, $io);
+my ($fh, $io, @cleanup);
+my $running = 1;
 {
     if (@ARGV) {
         @logfiles = @ARGV;
@@ -132,19 +135,24 @@ my ($fh, $io);
     elsif (defined $conf{'logfiles'}) {
         @logfiles = @{ $conf{'logfiles'} };
     }
-    else {
-        $fh = \*STDIN;
-    }
-    if (!$fh) {
+    if (@logfiles) {
         my $pid;
         $SIG{TERM} = $SIG{QUIT} = $SIG{INT} = sub {
-            close $fh if $fh;
-            kill $pid if $pid;
-            exit;
+            $running = 0;
+            push @cleanup, sub {
+                close $fh if $fh;
+                kill $pid if $pid;
+            };
         };
         $SIG{CHLD} = 'IGNORE';
         $pid = open $fh, '-|', qw(tail -F -n 0), @logfiles;
         die $! if !$pid;
+    }
+    else {
+        $fh = \*STDIN;
+        $SIG{TERM} = $SIG{QUIT} = $SIG{INT} = sub {
+            $running = 0;
+        };
     }
     $io = IO::Select->new($fh);
 }
@@ -157,10 +165,15 @@ $SIG{HUP} = sub { $hup = 1 };
 
 my $file = @logfiles ? $logfiles[0] : '/dev/stdin';
 my ($date, $tz);
-openlog('logvigil', '', 'local0') if $conf{'syslog'};
+if ($conf{'syslog'}) {
+    openlog('logvigil', '', 'local0');
+    push @cleanup, sub {
+        closelog();
+    }
+}
 
 ENTRY:
-while (1) {
+while ($running) {
     hup() if $hup;
     $now = time;
     my $timeout = check_queue();
@@ -215,7 +228,8 @@ continue {
     ($prev_date{$file}, $prev_tz{$file}) = ($date, $tz) if defined $file;
 }
 
-closelog() if $conf{'syslog'};
+$_->() for @cleanup;
+flush() if $conf{'flush'};
 
 # --- Functions
 
@@ -786,6 +800,7 @@ sub flush {
         $exp->(%$arg);
         delete $violation{$vkey};
     }
+    %violation = ();
 }
 
 sub dump {
