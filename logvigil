@@ -6,7 +6,7 @@ use warnings;
 use lib 'lib';
 
 use IO::Select;
-use POSIX qw(strftime);
+use POSIX qw(strftime setsid);
 use Net::CIDR::Lite;
 use File::Spec;
 use File::Basename qw(basename dirname);
@@ -23,7 +23,6 @@ use constant MAX_TIMEOUT => 60;
 use constant NEVER => 4294967295;  # 2 ** 32 - 1 == 21060207T062815Z
 
 $| = 1;
-$0 = 'logvigil';
 
 sub usage;
 sub fatal;
@@ -90,7 +89,7 @@ GetOptions(
     'k|window=i'      => sub { $cmdline_conf{'window'}    = $_[1] },
     'l|threshold=i'   => sub { $cmdline_conf{'threshold'} = $_[1] },
     'F|no-flush'      => sub { $cmdline_conf{'flush'}     = 0     },
-    'b|daemon'        => sub { $cmdline_conf{'daemon'}    = 0     },
+    'b|daemon'        => sub { $cmdline_conf{'daemon'}    = 1     },
 ) or usage;
 
 if ($dryrun) {
@@ -102,7 +101,7 @@ my %action = default_actions();
 @config_files = ($default_config_file) if !@config_files;
 
 load_config();
-quit() if $check_config;
+exit(0) if $check_config;
 
 daemonize() if $conf{'daemon'} && !$dryrun;
 
@@ -169,8 +168,10 @@ $SIG{HUP} = sub { $hup = 1 };
 my $file = @logfiles ? $logfiles[0] : '/dev/stdin';
 my ($date, $tz);
 if ($conf{'syslog'}) {
-    openlog('logvigil', '', 'local0');
+    openlog('logvigil', 'pid', 'local0');
+    logit('info', 'started');
     push @cleanup, sub {
+        logit('info', 'stopped');
         closelog();
     }
 }
@@ -231,7 +232,6 @@ continue {
     ($prev_date{$file}, $prev_tz{$file}) = ($date, $tz) if defined $file;
 }
 
-$_->() for @cleanup;
 quit();
 
 # --- Functions
@@ -610,14 +610,14 @@ sub make_action {
         my ($status, @msg) = @$list;
         $status ||= 0;
         return sub {
-            logit(join(' ', @msg)) if @msg;
+            logit('info', join(' ', @msg)) if @msg;
             quit($status);
         };
     }
     elsif ($type eq 'print') {
         return sub {
             my $msg = join(' ', expand($list, { %$cvar, @_ }));
-            logit($msg);
+            logit('info', $msg);
         };
     }
     elsif ($type eq 'exec') {
@@ -626,9 +626,10 @@ sub make_action {
             my @cmd = expand($list, \%arg);
             unshift @cmd, 'echo' if $dryrun;
             if (system(@cmd) != 0) {
-                logit("logvigil: action exited with status $? ($!): @cmd");
+                logit('err', "logvigil: action exited with status $? ($!): @cmd");
                 if ($arg{'debug'}) {
                     logit(
+                        'info',
                         "logvigil: variable values:",
                         map { "  $_ : $arg{$_}" } sort keys %arg
                     );
@@ -760,7 +761,7 @@ sub boolean {
 }
 
 sub hup {
-    logit("logvigil: reloading config files...") if $conf{'verbose'};
+    logit('info', "logvigil: reloading config files...") if $conf{'verbose'};
     load_config();
     my ($date, $time) = split / /, strftime('%Y-%m-%d %H:%M:%S', localtime);
     clear($date, $time);
@@ -794,7 +795,7 @@ sub parse_args {
 sub flush {
     my %arg = @_;
     # Leave the tail entry in the queue!
-    logit("flushing...") if $conf{'verbose'};
+    logit('info', "flushing...") if $conf{'verbose'};
     QUEUE:
     while (@queue > 1) {
         my $v = shift @queue;
@@ -847,7 +848,8 @@ sub default_actions {
 sub quit {
     my ($status) = @_;
     flush() if $conf{'flush'};
-    logit('exiting') if $conf{'verbose'};
+    logit('info', 'exiting') if $conf{'verbose'};
+    $_->() for @cleanup;
     exit($status||0);
 }
 
@@ -906,7 +908,7 @@ sub daemonize {
     open STDOUT, '>', '/dev/null' or fatal "open STDOUT to /dev/null: $!";
     open STDERR, '>&STDOUT'       or fatal "open STDERR to STDOUT: $!";
     chdir '/' or fatal "chdir /: $!";
-    POSIX::setsid();
+    setsid();
 }
 
 sub usage {
