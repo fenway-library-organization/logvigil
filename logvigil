@@ -61,7 +61,7 @@ my %default_conf = (
 );
 my @booleans = qw(syslog verbose debug);
 my (%conf, %cmdline_conf);
-my $check_config;
+my ($check_config, $dryrun);
 my $default_config_file = '/etc/logvigil/logvigil.conf';
 my @config_files;
 
@@ -71,7 +71,8 @@ GetOptions(
         $_[1] =~ /^(\w+)=(.*)$/ or usage;
         $cmdline_conf{$1} = $2;
     },
-    'n|check-config'  => sub { $cmdline_conf{'verbose'}   = $check_config = 1 },
+    'n|dry-run'       => \$dryrun,
+    't|check-config'  => sub { $cmdline_conf{'verbose'}   = $check_config = 1 },
     's|syslog'        => sub { $cmdline_conf{'syslog'}    = 1     },
     'S|nosyslog'      => sub { $cmdline_conf{'syslog'}    = 0     },
     'v|verbose'       => sub { $cmdline_conf{'verbose'}   = 1     },
@@ -83,14 +84,16 @@ GetOptions(
     'l|threshold=i'   => sub { $cmdline_conf{'threshold'} = $_[1] },
 ) or usage;
 
+if ($dryrun) {
+    print STDERR "Dry run -- echoing all actions\n";
+    open(STDOUT, '>&STDERR');
+}
+
 my %action = default_actions();
 @config_files = ($default_config_file) if !@config_files;
 
 load_config();
-
-if ($check_config) {
-    exit 0;
-}
+exit 0 if $check_config;
 
 # --- Variables
 
@@ -585,6 +588,7 @@ sub make_action {
         return sub {
             my %arg = @_;
             my @cmd = expand($list, \%arg);
+            unshift @cmd, 'echo' if $dryrun;
             if (system(@cmd) != 0) {
                 print STDERR "logvigil: action exited with status $? ($!): @cmd\n";
                 if ($arg{'debug'}) {
