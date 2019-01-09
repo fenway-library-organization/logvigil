@@ -1,0 +1,85 @@
+# Action to take when a violation is triggered
+set action     block
+
+# Action to take when a violation expires
+set expire     unblock
+
+# Use syslog?
+set syslog     off
+
+# Look for repeated requests
+set thresholds on
+set interval   1s
+set window     30s
+
+# Other variables -- may be used in actions
+set duration   60s
+set program    logvigil
+set sender     logvigil
+
+# Actions that we can take
+
+action warn {
+    print %(program): warning: %(message)
+}
+
+action block {
+    print '%(client) : %(url) matched %(trigger)'
+}
+
+action notify {
+    sh -c 'makemail -f %(sender) -m "%(message)" -s "%(subject)" -t %(recipient) | sendmail -f %(recipient)'
+}
+
+# Whitelists and blacklists
+
+whitelist {
+    # Special IPv4 addresses
+    10.0.0.0/8
+    172.16.0.0/12
+    192.168.0.0/16
+    127.0.0.0/8
+    # Special IPv6 addresses
+    ::1
+}
+
+blacklist {
+    1.2.3.4
+}
+
+# Violation triggers
+
+trigger action:    notify
+        recipient: maria@example.org
+        subject:   "Attack underway!"
+        message:   "An attack on our systems is currently in progress.  Please stand by."
+{
+    $url ~ ^/w00t
+    $method ~ ^$ 
+}
+
+trigger port:     80
+        duration: 4w
+{
+    # Self-advertised blackhats
+    ^/w00tw00t
+    (?i)environ%00
+}
+
+trigger duration:1w {
+    # Pointless attacks
+    (?i)phpmyadmin
+    (?i)phpalbum
+}
+
+trigger duration:1h {
+    # Minor infractions
+    http://\d+.\d+.\d+.\d+:80/
+    phpThumbDebug=9$
+    $method = PROPFIND
+}
+
+# include trigger.d/*.conf
+# include action.d/*.conf
+# include blacklist.d/*.conf
+# include whitelist.d/*.conf

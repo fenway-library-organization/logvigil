@@ -1,0 +1,840 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use lib 'lib';
+
+use IO::Select;
+use POSIX qw(strftime);
+use Sys::Syslog qw(:standard :macros);
+use Net::CIDR::Lite;
+use File::Spec;
+use File::Basename qw(basename dirname);
+use Getopt::Long
+    qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+
+use constant MAX_TIMEOUT => 60;
+use constant NEVER => 4294967295;  # 2 ** 32 - 1 == 21060207T062815Z
+
+$| = 1;
+$0 = 'logvigil';
+
+my %month = qw(Jan 01  Feb 02  Mar 03  Apr 04  May 05  Jun 06
+               Jul 07  Aug 08  Sep 09  Oct 10  Nov 11  Dec 12);
+
+my %multiplier = qw(
+    s       1
+    m      60
+    h    3600
+    d   86400
+    w  604800
+);
+
+# --- Options
+
+my (@skips, @whitelists, @triggers);
+push @whitelists, make_whitelist([qw(127.0.0.1/8 @private 10.0.0.0/8 @private 172.16.0.0/12 @private 192.168.0.0/16 @local)]);
+
+my %silent_whitelist = qw(127.0.0.1 ::1);
+my %whitelist_var;
+
+my %default_conf = (
+    'action'    => 'default',  # default violation action
+    'expire'    => 'default',  # default expiry action
+    'duration'  => 60,  # banishment duration (by convention)
+    'syslog'    =>  1,  # don't use syslog
+    'verbose'   =>  0,  # don't spew
+    'debug'     =>  0,  # no debugging stuff
+    'threshold' => 10,  # max 10 requests...
+    'interval'  =>  1,  #     ...in 1 second
+    'window'    => 30,  # look "back" 30 seconds at most
+    'threshold.message' => '%(date) %(time) VIOLATION %(client) %(port) -- %(count) requests in %(interval) seconds for %(url)',
+    'threshold.action' => 'default',
+    'trigger.message'   => '%(date) %(time) VIOLATION %(client) %(port) -- %(url) matches %(trigger)',
+    'trigger.action'   => 'default',
+    'control.message'   => '%(date) %(time) VIOLATION %(client) %(port)',
+    'control.action'   => 'default',
+    'whitelist.message' => '%(date) %(time) PASS %(client) %(class)',
+);
+my @booleans = qw(syslog verbose debug);
+my (%conf, %cmdline_conf);
+my $check_config;
+my $default_config_file = '/etc/logvigil/logvigil.conf';
+my @config_files;
+
+GetOptions(
+    'c|config-file=s' => \@config_files,
+    'D|define=s' => sub {
+        $_[1] =~ /^(\w+)=(.*)$/ or exit usage();
+        $cmdline_conf{$1} = $2;
+    },
+    'n|check-config'  => \$check_config,
+    's|syslog'        => sub { $cmdline_conf{'syslog'}    = 1     },
+    'S|nosyslog'      => sub { $cmdline_conf{'syslog'}    = 0     },
+    'v|verbose'       => sub { $cmdline_conf{'verbose'}   = 1     },
+    'V|noverbose'     => sub { $cmdline_conf{'verbose'}   = 0     },
+    'd|debug'         => sub { $cmdline_conf{'debug'}     =
+                               $cmdline_conf{'verbose'}   = 1     },
+    'i|interval=i'    => sub { $cmdline_conf{'interval'}  = $_[1] },
+    'k|window=i'      => sub { $cmdline_conf{'window'}    = $_[1] },
+    'l|threshold=i'   => sub { $cmdline_conf{'threshold'} = $_[1] },
+) or exit usage();
+
+my %action = default_actions();
+@config_files = ($default_config_file) if !@config_files;
+
+load_config();
+
+if ($check_config) {
+    print STDERR "Config file OK\n" if $cmdline_conf{'verbose'};
+    exit 0;
+}
+
+# --- Variables
+
+my ($now, $hup);
+my (%prev_date, %prev_tz, %whitelist_cache);
+my %sec2hits;
+my @queue = [ NEVER, sub { exit 0 }, {} ];
+my %expire_action;
+if (!$action{'default'}) {
+    my $name = $conf{'action'};
+    $action{'default'} = $action{$name} || make_action([ qw{ print logvigil: violation: %(logline) } ]);
+}
+if (!$action{'expire'}) {
+    my $name = $conf{'expire'};
+    $action{'expire'} = $action{$name} || make_action([ qw{ print logvigil: expired: %(logline) } ]);
+}
+
+# --- Tail the specified files if applicable
+
+my @logfiles;
+my ($fh, $io);
+{
+    if (@ARGV) {
+        @logfiles = @ARGV;
+    }
+    elsif (defined $conf{'logfile'}) {
+        die if $conf{'logfiles'};
+        @logfiles = ( $conf{'logfile'} );
+    }
+    elsif (defined $conf{'logfiles'}) {
+        @logfiles = @{ $conf{'logfiles'} };
+    }
+    else {
+        $fh = \*STDIN;
+    }
+    if (!$fh) {
+        my $pid;
+        $SIG{TERM} = $SIG{QUIT} = $SIG{INT} = sub {
+            close $fh if $fh;
+            kill $pid if $pid;
+            exit;
+        };
+        $SIG{CHLD} = 'IGNORE';
+        $pid = open $fh, '-|', qw(tail -F -n 0), @logfiles;
+        die $! if !$pid;
+    }
+    $io = IO::Select->new($fh);
+}
+
+# --- Signal handling
+
+$SIG{HUP} = sub { $hup = 1 };
+
+# --- Go!
+
+my $file = @logfiles ? $logfiles[0] : '/dev/stdin';
+my ($date, $tz);
+openlog 'logvigil', '', 'local0' if $conf{'syslog'};
+
+ENTRY:
+while (1) {
+    hup() if $hup;
+    $now = time;
+    my $timeout = check_queue();
+    if (my $entry = read_next($timeout)) {
+        # Check for a direct action
+        if ($entry->{'action'}) {
+            $entry->{'action'}->(@{ $entry->{'args'} || [] });
+            next;
+        }
+        my $client = $entry->{'client'};
+        next if !defined $client;
+        next if $silent_whitelist{$client};
+        # Check lines that we always skip
+        my $url = $entry->{'url'};
+        if (defined $url) {
+            foreach my $s (@skips) {
+                next ENTRY if $url =~ $s;
+            }
+        }
+        # Check whitelists
+        if ($client !~ /[-G-Zg-z]/) {
+            if (my $wc = $whitelist_cache{$client}) {
+                whitelisted(%$wc) if !$wc->{'silent'};
+                next ENTRY;
+            }
+            foreach my $w (@whitelists) {
+                my $key2class = $w->find($client);
+                if (exists $key2class->{$client}) {
+                    my @classes = keys %{ $key2class->{$client} };
+                    if (@classes) {
+                        my %c = ( %conf, %$entry, %{ $whitelist_var{$w} }, 'class' => join(',', @classes) );
+                        whitelisted(%c) if !$c{'silent'};
+                        $whitelist_cache{$client} = \%c;
+                        next ENTRY;
+                    }
+                }
+            }
+        }
+        # Check triggers
+        foreach my $t (@triggers) {
+            local $_ = $entry;
+            if (my $var = $t->()) {
+                trigger_violation(%conf, %$entry, %$var);
+                last if !$conf{'multitrigger'};
+            }
+        }
+        # Check thresholds
+        check_threshold(\%conf, $entry);
+    }
+}
+continue {
+    ($prev_date{$file}, $prev_tz{$file}) = ($date, $tz) if defined $file;
+}
+
+closelog if $conf{'syslog'};
+
+# --- Functions
+
+sub read_next {
+    my ($timeout) = @_;
+    my @ready = $io->can_read($timeout);
+    return if !@ready;
+    my ($line, $entry);
+    foreach my $fh (@ready) {
+        local $SIG{'ALRM'} = sub { };
+        alarm(5);
+        $line = <$fh>;
+        return if !defined $line;
+        if ($line =~ /^==> (.+) <==$/) {
+            $file = $1;
+            $line = <$fh>;
+        }
+        alarm(0);
+        last if defined $line;
+    }
+    return if !defined $line;
+    if ($line =~ /^\*([A-Z]+)(?:\s+(.+))?$/) {
+        # Control command
+        my $cmd = $action{$1} || return;
+        my @args = parse_args($2);
+        return {
+            'action' => $cmd,
+            'args'   => \@args,
+        };
+    }
+    $entry = parse_entry($file, $line) || return;
+    return $entry;
+}
+
+sub check_queue {
+    my $t;
+    while (@queue && ($t = $queue[0][0]) <= $now) {
+        my $entry = shift @queue;
+        my (undef, $exp, $arg) = @$entry;
+        $exp->(%$arg);
+    }
+    $t = $queue[0][0] - $now;
+    return MAX_TIMEOUT if $t <= 0 || $t > MAX_TIMEOUT;
+    return $t;
+}
+
+sub parse_entry {
+    goto &parse_common_log_entry;
+}
+
+sub parse_common_log_entry {
+    my ($file, $line) = @_;
+    my ($client, $d, $mon, $Y, $H, $M, $S, $tz, $req, $status, $bytes, $ref, $ua) = (
+        $line =~ m{^(\S+) \S+ \S+ \[(\d+)/(\w+)/(\d+):(\d+):(\d+):(\d+) ([^\]]+)\] "([^"]*)" (\d\d\d) (\S+)(?: "([^"]*)" "([^"]*)")?}
+    );
+    return if !defined $client;
+    chomp $line;
+    my $date = strftime('%Y-%m-%d', 0, 0, 0, $d, $month{$mon} - 1, $Y - 1900);
+    my $time = join(':', $H, $M, $S);
+    my $daysec = $H * 3600 + $M * 60 + $S;
+    my ($method, $url, $protocol) = (
+        $req =~ /^(\S+) (\S+) (.+)$/
+    );
+    if (!defined $method) {
+        $method = $protocol = '';
+        $url = $req;
+    }
+    return {
+        'file'     => $file,
+        'logline'  => $line,
+        'now'      => $now,
+        'client'   => $client,
+        'date'     => $date,
+        'time'     => $time,
+        'sec'      => $daysec,
+        'tz'       => $tz,
+        'method'   => $method,
+        'url'      => $url,
+        'protocol' => $protocol,
+        'status'   => $status,
+        'bytes'    => $bytes,
+        ( defined $ref ? ('referrer'   => $ref) : () ),
+        ( defined $ua  ? ('user_agent' => $ua ) : () ),
+    };
+}
+
+sub threshold_violation { violation($conf{'threshold.message'},   @_) }
+sub trigger_violation   { violation($conf{'trigger.message'}, @_) }
+sub control_violation {
+    my @now = localtime $now;
+    violation(
+        $conf{'control.message'},
+        %conf,
+        @_,
+        'now'  => $now,
+        'date' => strftime('%Y-%m-%d', @now),
+        'time' => strftime('%H:%M:%S', @now),
+    );
+}
+
+sub violation {
+    my ($message, %arg) = @_;
+    logit('err', expand($message, \%arg)) if $arg{'verbose'};
+    my $dur = dur2sec($arg{'duration'});
+    my $cmd = $action{$arg{'action'} || 'default'} || return;
+    my $exp = $action{$arg{'expire'} || 'expire'};
+    $cmd->(%arg);
+    enqueue($now + $dur, $exp, \%arg) if $exp;
+}
+
+sub enqueue {
+    my ($t, $exp, $arg) = @_;
+    my ($l, $r) = (0, scalar @queue);
+    while ($l < $r) {
+        my $i = int(($l+$r)/2);
+        if ($t > $queue[$i][0]) {
+            $l = $i + 1;
+        }
+        else {
+            $r = $i;
+        }
+    }
+    splice @queue, $l, 0, [$t, $exp, $arg];
+}
+# while ($i > 0 && $t < $queue[$i][0]) {
+#     $i--;
+# }
+# splice @queue, $i+1, 0, [$t, $exp, $arg];
+
+sub expand {
+    my ($val, $var) = @_;
+    my @val;
+    if (ref $val) {
+        @val = map { expand($_, $var) } @$val;
+    }
+    else {
+        $val =~ s/%\(\s*(\w+)\s*\)/value($var->{$1})/eg;
+        @val = ($val);
+    }
+    return wantarray ? @val : $val[0];
+}
+
+sub value {
+    my ($val) = @_;
+    return '' if !defined $val;
+    return $val if !ref $val;
+    return join(' ', @$val);
+}
+
+sub whitelisted {
+    my (%arg) = @_;
+    logit('debug', expand($arg{'whitelist.message'}, \%arg)) if $arg{'verbose'};
+}
+
+sub clear {
+    my ($date, $time) = @_;
+    my %arg = (
+        'date' => $date,
+        'time' => $time,
+    );
+    logit('info', expand('%(date) %(time) CLEAR', \%arg)) if $conf{'verbose'};
+    %sec2hits = %whitelist_cache = ();
+}
+
+sub logit {
+    if ($conf{'syslog'}) {
+        syslog(@_);
+    }
+    else {
+        my $priority = shift;
+        print STDERR $_, "\n" for @_;
+    }
+}
+
+sub tokenize_file {
+    my ($f) = @_;
+    open my $fh, '<', $f or die "Can't open config file $f: $!";
+    my @tok;
+    local $_;
+    while (<$fh>) {
+        next if /^\s*(#.*)?$/;  # Skip blank lines and comments
+        chomp;
+        $_ .= ' ';
+        while (s{
+            \A
+            \s*
+            (?:
+                ([^"'\#<\s]+)
+                |
+                " ([^"]*) "
+                |
+                ' ([^']*) '
+                |
+                ( \# .* )
+                |
+                < \s* ([^<>\s]+) \s* >
+            )
+            \s+
+        }{}x) {
+            if (defined $1) {
+                push @tok, $1;
+            }
+            elsif (defined $2) {
+                push @tok, $2;
+            }
+            elsif (defined $3) {
+                push @tok, $3;
+            }
+            elsif (defined $4) {
+                next;
+            }
+            elsif (defined $5) {
+                local $_;
+                my $fincl = File::Spec->rel2abs($5, dirname($f));
+                my @fincl;
+                if (-d $fincl) {
+                    @fincl = glob("$fincl/*");
+                }
+                else {
+                    @fincl = glob($fincl);
+                    die "No such file: $fincl" if !@fincl;
+                }
+                push @tok, @{ tokenize_file($_) } for @fincl;
+            }
+        }
+    }
+    close $fh;
+    return \@tok;
+}
+
+sub read_config_file {
+    my ($f) = @_;
+    my $tok = tokenize_file($f);
+    while (@$tok) {
+        _assignment($tok)
+        ||
+        _skip_block($tok)
+        ||
+        _action_block($tok)
+        ||
+        _whitelist_block($tok)
+        ||
+        _trigger_block($tok)
+        ||
+        _syntax_error($tok);
+    }
+}
+
+sub _syntax_error {
+    my ($tok) = @_;
+    die "tok: @$tok\n";
+}
+
+sub _assignment {
+    my ($tok) = @_;
+    return if $tok->[0] ne 'set'; shift @$tok; die if @$tok < 2;
+    my $key = shift @$tok;
+    if ($tok->[0] =~ /^[<{]$/) {
+        $conf{$key} = _list($tok);
+    }
+    else {
+        $conf{$key} = shift @$tok;
+    }
+    1;
+}
+
+sub _action_block {
+    my ($tok) = @_;
+    return if $tok->[0] ne 'action'; shift @$tok;
+    my $name = shift @$tok;
+    my ($cvar, $list) = _block($tok);
+    $action{$name} = make_action($list, $cvar);
+    1;
+}
+
+sub _whitelist_block {
+    my ($tok) = @_;
+    return if $tok->[0] ne 'whitelist'; shift @$tok;
+    my ($wvar, $addrs) = _block($tok);
+    push @whitelists, make_whitelist($addrs, $wvar);
+    1;
+}
+
+sub _skip_block {
+    # skip {
+    #     ^[^%?]+\.css$
+    #     ^[^%?]+\.js$
+    # }
+    #
+    my ($tok) = @_;
+    return if $tok->[0] ne 'skip'; shift @$tok;
+    my ($tvar, $list) = _block($tok);
+    if (@$list) {
+        my $skip = join('|', @$list);
+        push @skips, qr/$skip/;
+    }
+    1;
+}
+
+sub _trigger_block {
+    my ($tok) = @_;
+    return if $tok->[0] ne 'trigger'; shift @$tok;
+    my ($tvar, $list) = _block($tok);
+    while (@$list) {
+        my $trigger;
+        if ($list->[0] =~ /^\$/) {
+            # $method = PUT
+            # $url !~ ^\/
+            die "tok: @$tok\n" if @$list < 3;
+            $trigger = join(' ', splice(@$list, 0, 3));
+        }
+        else {
+            $trigger = shift @$list;
+        }
+        push @triggers, make_trigger($trigger, $tvar);
+    }
+    1;
+}
+
+sub _block {
+    my ($tok) = @_;
+    die if !@$tok;
+    my %var;
+    while ($tok->[0] !~ /^[{<]$/) {
+        my $key = shift @$tok;
+        my $val;
+        if ($key =~ s/:$//) {
+            $val = shift @$tok;
+        }
+        elsif ($key =~ s/:(.+)$//) {
+            $val = $1;
+        }
+        else {
+            die;
+        }
+        $var{$key} = $val;
+    }
+    return \%var, _list($tok);
+}
+
+sub _list {
+    my ($list) = @_;
+    my @list;
+    die if $list->[0] ne '{';
+    shift @$list;
+    while (@$list) {
+        my $tok = shift @$list;
+        return \@list if $tok eq '}';
+        push @list, $tok;
+    }
+    die;
+}
+
+sub make_action {
+    my ($list, $cvar) = @_;
+    my $type = shift @$list;
+    $type = 'null' if !defined $type;
+    if ($type eq 'exit') {
+        my ($status, @msg) = @$list;
+        $status ||= 0;
+        return sub {
+            print STDERR join(' ', @msg), "\n" if @msg;
+            exit $status;
+        };
+    }
+    elsif ($type eq 'print') {
+        return sub {
+            my $msg = join(' ', expand($list, { %$cvar, @_ }));
+            print STDERR $msg, "\n";
+        };
+    }
+    elsif ($type eq 'exec') {
+        return sub {
+            my %arg = @_;
+            my @cmd = expand($list, \%arg);
+            if (system(@cmd) != 0) {
+                print STDERR "logvigil: action exited with status $? ($!): @cmd\n";
+                if ($arg{'debug'}) {
+                    print STDERR "logvigil: variable values:\n";
+                    print STDERR "  $_ : $arg{$_}\n" for sort keys %arg;
+                }
+            }
+        };
+    }
+    elsif ($type eq 'null') {
+        return sub { }
+    }
+}
+
+sub make_whitelist {
+    my ($addrs, $wvar) = @_;
+    my (@w4, @w6);
+    while (@$addrs) {
+        local $_ = shift @$addrs;
+        my $w;
+        if (s/^ipv6=(.+)//i || /:/) {
+            $w = \@w6;
+        }
+        else {
+            s/^ipv4=//i;
+            $w = \@w4;
+        }
+        push @$w, $_;
+        if (@$addrs && $addrs->[0] =~ /^@(.+)/) {
+            push @$w, $1;
+            shift @$addrs;
+        }
+        else {
+            push @$w, 'whitelisted';
+        }
+    }
+    my @w;
+    push @w, Net::CIDR::Lite::Span->new(@w4) if @w4;
+    push @w, Net::CIDR::Lite::Span->new(@w6) if @w6;
+    $whitelist_var{$_} = $wvar || {} for @w;
+    return @w;
+}
+
+sub make_trigger {
+    local $_ = shift;
+    chomp;
+    my ($tvar) = @_;
+    while (s/^\s+(\w+):\s*(?:"([^"]*)"|'([^']*)'|(\S+))//) {
+        if    (defined $2) { $tvar->{$1} = $2 }
+        elsif (defined $3) { $tvar->{$1} = $3 }
+        else               { $tvar->{$1} = $4 }
+    }
+    my ($key, $op) = qw(url ~);
+    ($key, $op) = ($1, $2) if s/^\$(\w+)\s+(!?=|!?~)\s+//;
+    my $val = $tvar->{'trigger'} = $_;
+    my $crossed = sub { 1 };
+    my $t = $tvar->{'threshold'};
+    if ($t) {
+        my %sec2hits;
+        $crossed = sub {
+            my ($entry) = @_;
+            # Clear requests and bans whenever the date or time zone changes *in a particular file*
+            my ($file, $date, $time, $tz, $sec) = @$entry{qw(file date time tz sec)};
+            my $pdate = $prev_date{$file} ||= $date;
+            my $ptz   = $prev_tz{$file}   ||= $tz;
+            if ($date ne $pdate || $tz ne $ptz) {
+                my %arg = (
+                    'date' => $date,
+                    'time' => $time,
+                );
+                logit('info', expand('%(date) %(time) CLEAR', \%arg)) if $conf{'verbose'};
+                %sec2hits = ();
+            }
+            # Count any hits that aren't more than $interval + $window seconds older than this one
+            my $count = 0;
+            my $count_window = $sec - $t;
+            my $buffer_window = $count_window - 30;
+            my @old;
+            while (my ($s, $hits) = each %sec2hits) {
+                if ($s <= $buffer_window) {
+                    push @old, $s;
+                }
+                elsif ($s > $count_window) {
+                    my $c = $hits->{$key};
+                    $count += $c if $c;
+                }
+                else {
+                    # Too old to count but not too old to discard.  We have to keep, but ignore,
+                    # these lines because log entries are not always in strict chronological order
+                }
+            }
+            delete @sec2hits{@old} if @old;
+            $sec2hits{$sec}->{$key}++;
+            if ($count > $t) {
+                # We have a violation!
+                threshold_violation(%$tvar, %$entry, 'count' => $count);
+                # Clear the count for this hit
+                delete $sec2hits{$sec}->{$key};
+            }
+        };
+    }
+    return sub {
+        $tvar if $_->{$key} eq $val && $crossed->($_)
+    } if $op eq '=';
+    return sub {
+        $tvar if $_->{$key} ne $val && $crossed->($_)
+    } if $op eq '!=';
+    $val = qr/$val/;
+    return sub {
+        $tvar if $_->{$key} =~ $val && $crossed->($_)
+    } if $op eq '~';
+    return sub {
+        $tvar if $_->{$key} !~ $val && $crossed->($_)
+    } if $op eq '!~';
+}
+
+sub dur2sec {
+    my ($dur) = @_;
+    my $sec = 0;
+    while ($dur =~ s/^(\d+)([wdhms])//i) {
+        $sec += $1 * $multiplier{$2};
+    }
+    $sec += $1 if $dur =~ s/^(\d+)$//;
+    warn "Ignoring junk at end of duration: $dur"
+        if length $dur;
+    return $sec;
+}
+
+sub boolean {
+    return ( defined($_[0]) && $_[0] =~ /^(y|yes|true|on|1)$/i ) ? 1 : 0;
+}
+
+sub usage {
+    print STDERR "usage: logvigil [OPTION]... [COMMAND [ARG]...]\n";
+    exit 1;
+}
+
+sub hup {
+    print STDERR "logvigil: reloading config files...\n" if $conf{'verbose'};
+    load_config();
+    my ($date, $time) = split / /, strftime('%Y-%m-%d %H:%M:%S', localtime);
+    clear($date, $time);
+    undef $hup;
+}
+
+sub load_config {
+    %conf = %default_conf;
+    read_config_file(File::Spec->rel2abs($_)) for @config_files;
+    # Command-line options override config files
+    while (my ($key, $val) = each %cmdline_conf) {
+        $conf{$key} = $val;
+    }
+    $conf{$_} = boolean($conf{$_}) for @booleans;
+}
+
+sub parse_args {
+    my ($str) = @_;
+    return if !defined $str || !length $str;
+    return map { my ($k, $v) = split /=/, $_, 2; ( $k => $v ) } split /\s+/, $str;
+}
+
+sub flush {
+    my %arg = @_;
+    # Leave the tail entry in the queue!
+    QUEUE:
+    while (@queue > 1) {
+        my $entry = shift @queue;
+        my ($t, $exp, $arg) = @$entry;
+        while (my ($k, $v) = each %arg) {
+            next QUEUE if !defined $arg->{$k};
+            next QUEUE if $arg->{$k} ne $arg{$k};
+        }
+        $exp->(%$arg);
+    }
+}
+
+sub dump {
+    my %arg = @_;
+    my $file = $arg{'file'};
+    my $fh;
+    if (defined $file) {
+        open $fh, '>>', $file or return;
+    }
+    else {
+        $fh = \*STDOUT;
+    }
+    foreach (@queue[0..$#queue-1]) {
+        my ($t, undef, $arg) = @$_;
+        my %arg = ( %$arg, 'expiration' => strftime('%Y%m%dT%H%M%S', localtime($t)) );
+        foreach my $key (sort keys %arg) {
+            my $val = $arg{$key};
+            print $fh $key, ' ', $val, "\n" if defined $val;
+        }
+        print $fh "\n";
+        #my ($client, $port, $dur, $trigger) = @$arg{qw(client port duration trigger)};
+        #my $exp = strftime('%Y%m%dT%H%M%S', localtime($t));
+        #printf $fh "trigger %s client %s port %s duration %s expires %s\n", $trigger, $client, $port, $dur, $exp;
+    }
+    #print $fh "\n";
+}
+
+sub default_actions {
+    return (
+        'HUP'   => \&hup,
+        'FLUSH' => \&flush,
+        'EXIT'  => sub { exit 0 },
+        'DUMP'  => \&dump,
+        'VIOL'  => \&control_violation,
+    );
+}
+
+{
+    my ($date, $time, $tz, %prev_date, %prev_tz);
+    sub check_threshold {
+        my ($entry, $conf) = @_;
+        my $t = $conf->{'threshold'} || return;
+        my $file = $entry->{'file'};
+        my $key = $entry->{$conf->{'hit'} || 'hit'};
+        return if !defined $key;
+
+        # Clear requests and bans whenever the date or time zone changes *in a particular file*
+        ($date, $time, $tz) = @$entry{qw(date time tz)};
+        $prev_date{$file} ||= $date;
+        $prev_tz{$file}   ||= $tz;
+        clear($date, $time) if $date ne $prev_date{$file}
+                            || $tz   ne $prev_tz{$file};
+
+        # Count any hits that aren't more than $interval + $window seconds older than this one
+        my $count = 0;
+        my $sec = $entry->{'sec'};
+        my $count_window = $sec - $t;
+        my $buffer_window = $count_window - 30;
+        my @old;
+        while (my ($s, $hits) = each %sec2hits) {
+            if ($s <= $buffer_window) {
+                push @old, $s;
+            }
+            elsif ($s > $count_window) {
+                my $c = $hits->{$key};
+                $count += $c if $c;
+            }
+            else {
+                # Too old to count but not too old to discard.  We have to keep, but ignore,
+                # these lines because log entries are not in strictly chrnological order
+            }
+        }
+        delete @sec2hits{@old} if @old;
+        $sec2hits{$sec}->{$key}++;
+        if ($count > $t) {
+            # We have a violation!
+            threshold_violation(%$conf, %$entry, 'count' => $count);
+            # Clear the count for this hit
+            delete $sec2hits{$sec}->{$key};
+        }
+    }
+}
+
