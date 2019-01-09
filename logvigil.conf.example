@@ -31,7 +31,7 @@ action notify {
     sh -c 'makemail -f %(sender) -m "%(message)" -s "%(subject)" -t %(recipient) | sendmail -f %(recipient)'
 }
 
-# Whitelists and blacklists
+# Whitelists
 
 whitelist {
     # Special IPv4 addresses
@@ -41,10 +41,6 @@ whitelist {
     127.0.0.0/8
     # Special IPv6 addresses
     ::1
-}
-
-blacklist {
-    1.2.3.4
 }
 
 # Violation triggers
@@ -81,5 +77,4 @@ trigger duration:1h {
 
 # include trigger.d/*.conf
 # include action.d/*.conf
-# include blacklist.d/*.conf
 # include whitelist.d/*.conf
