@@ -24,7 +24,11 @@ action warn {
 }
 
 action block {
-    print '%(client) : %(url) matched %(trigger)'
+    exec /sbin/iptables -A INPUT -p tcp -s %(client) --dport %(port) -j %(fate)
+}
+
+action unblock {
+    exec /sbin/iptables -D INPUT -p tcp -s %(client) --dport %(port) -j %(fate)
 }
 
 action notify {
@@ -51,7 +55,7 @@ trigger action:    notify
         message:   "An attack on our systems is currently in progress.  Please stand by."
 {
     $url ~ ^/w00t
-    $method ~ ^$ 
+    $method = ""
 }
 
 trigger port:     80
@@ -75,6 +79,6 @@ trigger duration:1h {
     $method = PROPFIND
 }
 
-# include trigger.d/*.conf
-# include action.d/*.conf
-# include whitelist.d/*.conf
+<trigger.d>
+<action.d>
+<whitelist.d>
