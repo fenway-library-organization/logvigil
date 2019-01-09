@@ -101,7 +101,7 @@ my %action = default_actions();
 @config_files = ($default_config_file) if !@config_files;
 
 load_config();
-exit 0 if $check_config;
+quit() if $check_config;
 
 # --- Variables
 
@@ -607,14 +607,14 @@ sub make_action {
         my ($status, @msg) = @$list;
         $status ||= 0;
         return sub {
-            print STDERR join(' ', @msg), "\n" if @msg;
+            logit(join(' ', @msg)) if @msg;
             quit($status);
         };
     }
     elsif ($type eq 'print') {
         return sub {
             my $msg = join(' ', expand($list, { %$cvar, @_ }));
-            print STDERR $msg, "\n";
+            logit($msg);
         };
     }
     elsif ($type eq 'exec') {
@@ -623,10 +623,12 @@ sub make_action {
             my @cmd = expand($list, \%arg);
             unshift @cmd, 'echo' if $dryrun;
             if (system(@cmd) != 0) {
-                print STDERR "logvigil: action exited with status $? ($!): @cmd\n";
+                logit("logvigil: action exited with status $? ($!): @cmd");
                 if ($arg{'debug'}) {
-                    print STDERR "logvigil: variable values:\n";
-                    print STDERR "  $_ : $arg{$_}\n" for sort keys %arg;
+                    logit(
+                        "logvigil: variable values:",
+                        map { "  $_ : $arg{$_}" } sort keys %arg
+                    );
                 }
             }
         };
@@ -755,7 +757,7 @@ sub boolean {
 }
 
 sub hup {
-    print STDERR "logvigil: reloading config files...\n" if $conf{'verbose'};
+    logit("logvigil: reloading config files...") if $conf{'verbose'};
     load_config();
     my ($date, $time) = split / /, strftime('%Y-%m-%d %H:%M:%S', localtime);
     clear($date, $time);
@@ -789,6 +791,7 @@ sub parse_args {
 sub flush {
     my %arg = @_;
     # Leave the tail entry in the queue!
+    logit("flushing...") if $conf{'verbose'};
     QUEUE:
     while (@queue > 1) {
         my $v = shift @queue;
@@ -841,7 +844,7 @@ sub default_actions {
 sub quit {
     my ($status) = @_;
     flush() if $conf{'flush'};
-    print STDERR "exiting\n";
+    logit('exiting') if $conf{'verbose'};
     exit($status||0);
 }
 
@@ -893,11 +896,11 @@ sub quit {
 
 sub usage {
     print STDERR "usage: logvigil [OPTION]... [COMMAND [ARG]...]\n";
-    exit 1;
+    quit(1);
 }
 
 sub fatal {
     print STDERR "logvigil: @_\n";
-    exit 2;
+    quit(2);
 }
 
